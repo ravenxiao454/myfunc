@@ -1,0 +1,560 @@
+const partial = function(func, ...args){
+    if (func.constructor.name.startsWith("Async")||func.constructor.name.startsWith("Promise")){
+        return async (...rest) => await func(...args, ...rest)
+    }
+    return (...rest) => func(...args, ...rest);
+}
+function arrayEqual(array1,array2){
+    if (array1.length != array2.length){
+        return false
+    }
+    for (let i =0;i<array1.length;i++){
+        if (array1[i] != array2[i]){
+            return false
+        }
+    }
+    return true
+}
+function byteToString(arr) {
+    if(typeof arr === 'string') {
+        return arr;
+    }
+    var str = '',
+        _arr = arr;
+    for(var i = 0; i < _arr.length; i++) {
+        var one = _arr[i].toString(2),
+            v = one.match(/^1+?(?=0)/);
+        if(v && one.length == 8) {
+            var bytesLength = v[0].length;
+            var store = _arr[i].toString(2).slice(7 - bytesLength);
+            for(var st = 1; st < bytesLength; st++) {
+                store += _arr[st + i].toString(2).slice(2);
+            }
+            str += String.fromCharCode(parseInt(store, 2));
+            i += bytesLength - 1;
+        } else {
+            str += String.fromCharCode(_arr[i]);
+        }
+    }
+    return str;
+}
+
+export async function* iter_request(reader,chunk_size){
+    var cache = []
+    while (true) {
+        const { done, value } = await reader.read()
+        if (done) {
+          break
+        }
+        cache = cache.concat(Array.from(value))
+        while (cache.length > chunk_size){
+            yield Uint8Array.from(cache.slice(0,chunk_size))
+            cache = cache.slice(chunk_size)
+        }
+    }
+    yield Uint8Array.from(cache)
+}
+export async function* iter_dbchunks(chunk,callback){
+    var max_buffer_size=1048576
+    var LEAF_INDEX = [10]
+    var LEAF_TABLE = [13]
+    function _leaf_header_unpack(array){
+        var t1 = new DataView(array.slice(0,2).buffer).getUint16()
+        var t2 = new DataView(array.slice(2,4).buffer).getUint16()
+        var t3 = new DataView(array.slice(4,6).buffer).getUint16()
+        var t4 = array[6]
+        return [t1,t2,t3,t4]
+    }
+    
+    function _unsigned_short_iter_unpack(array){
+        var ret = []
+        for (var i = 0;i<array.length;i=i+2){
+            ret.push(new DataView(array.slice(i,i+2).buffer).getUint16())
+        }
+        return ret
+    }
+    function _interior_header_unpack(array){
+        var t1 = new DataView(array.slice(0,2).buffer).getUint16()
+        var t2 = new DataView(array.slice(2,4).buffer).getUint16()
+        var t3 = new DataView(array.slice(4,6).buffer).getUint16()
+        var t4 = array[6]
+        var t5 = new DataView(array.slice(7,11).buffer).getUint32()
+        return [t1,t2,t3,t4,t5]
+    }
+    var master_row_constructor = function(rowid, type, name, tbl_name, rootpage, sql){
+        return {
+            _:'MasterRow',
+            rowid:rowid,
+            type:type,
+            name:name,
+            tbl_name,tbl_name,
+            rootpage,rootpage,
+            sql:sql
+        }
+    }
+    var column_constructor = function(cid, name, type, notnull, dflt_value, pk){
+        return {
+            _:'Column',
+            cid:cid,name:name,type:type,notnull:notnull,dflt_value:dflt_value,pk:pk
+        }
+    }
+    async function get_byte_reader(iterable){
+        var chunk = new Uint8Array()
+        var offset = 0
+        var it = iterable
+        var ret = function (chunk,offset,it){
+            async function* _yield_num(num){
+                while (num){
+                    if (chunk.length == 0){
+                        var chunknext = await it.next()
+                        chunk = chunknext.value
+                    }
+                    const to_yield = Math.min(num,chunk.length-offset)
+                    yield chunk.slice(offset,offset+to_yield)
+                    num = num - to_yield
+                    offset = (offset + to_yield) % chunk.length
+                    chunk = offset>0?chunk:new Uint8Array() 
+                }
+            }
+            async function _get_num(num){
+                var total_chunk = []
+                var itval = await _yield_num(num)
+                var itnext = await itval.next()
+                while (!itnext.done){
+                    total_chunk = total_chunk.concat(Array.from(itnext.value))
+                    itnext = await itval.next()
+                }
+                return Uint8Array.from(total_chunk)
+            }
+            async function _finish(){
+                try{
+                    while (1){
+                        await it.next()
+                    }
+                }catch(e){
+                    return
+                }
+            }
+            return [_get_num,_finish]
+        }(chunk,offset,it)
+        return ret
+    }
+    function get_chunk_readers(chunk,p=0){
+        var ret = function(chunk,p){
+            function _get_num(num){
+                var p_orig = p
+                p = p + num
+                return chunk.slice(p_orig,p_orig + num)
+            }
+            function _get_varint(){
+                var value = 0
+                var high_bit = 1
+                var i = 0
+                while (high_bit && i < 9){
+                    high_bit = chunk[p] & 0x80
+                    value = i==8?((value << 8) + chunk[p]):((value << 7) + (chunk[p] & 0x7F))
+                    i = i+1
+                    p = p+1
+                }
+                var is_negative = value & 0x8000000000000000
+                value = !is_negative?(value):(-1 * (~(value - 1) & 0xFFFFFFFFFFFFFFFF))
+                return [value,i]
+            }
+            return [_get_num,_get_varint]
+        }(chunk,p)
+        return ret
+    }
+    function parse_header(header){
+        var status = 'ok'
+        var page_size, num_pages_expected, first_freelist_trunk_page, incremental_vacuum
+        var dbHeader = [83, 81, 76, 105, 116, 101, 32, 102, 111, 114, 109, 97, 116, 32, 51, 0]//"SQLite format 3\0"
+        if (!arrayEqual(header.slice(0,16),dbHeader)){
+            status = "file format wrong"
+        }
+        var encoding = new DataView(header.slice(56,60).buffer).getUint32()
+        if (encoding != 0 && encoding != 1){
+            status = "encoding wrong"
+        }
+        if (header[20] != 0){
+            status = 'Reserved space is not supported'
+        }
+        if (status == 'ok'){
+            page_size = new DataView(header.slice(16,18).buffer).getUint16()
+            page_size = page_size==1?65536:page_size
+            num_pages_expected = new DataView(header.slice(28,32).buffer).getUint32()
+            first_freelist_trunk_page = new DataView(header.slice(32,36).buffer).getUint32()
+            incremental_vacuum = !arrayEqual(header.slice(52,56),[0,0,0,0])
+        }
+        return [status,page_size,num_pages_expected,first_freelist_trunk_page,incremental_vacuum]
+    }
+    async function* iter_page(get_bytes, page_size, num_pages_expected, incremental_vacuum){
+        let page_bytes = new Uint8Array(page_size)
+        page_bytes.set(await get_bytes(page_size-100),100)
+        var [page_reader, _1] = get_chunk_readers(page_bytes)
+        page_reader(100)
+        let lock_byte_page = Math.floor(1073741824 / page_size) + 1
+        let ptrmap_j = Math.floor(page_size/5) + 1
+        yield [1,page_bytes,page_reader]
+
+        for (let page_num = 2;page_num<num_pages_expected + 1;page_num++){
+            page_bytes = await get_bytes(page_size)
+            var [page_reader,_1] = get_chunk_readers(page_bytes)
+            var ptrmap_page_prev = incremental_vacuum && (page_num - 1 - 2) % ptrmap_j == 0
+            var ptrmap_page_curr = incremental_vacuum && (page_num - 2) % ptrmap_j == 0
+            var lock_byte_page_prev = (page_num - 1) == lock_byte_page
+            var lock_byte_page_curr = page_num == lock_byte_page
+            if (ptrmap_page_curr){continue}
+            if (lock_byte_page_curr){continue}
+            if (ptrmap_page_prev && lock_byte_page_prev){continue}
+            yield [page_num,page_bytes,page_reader]
+        }
+    }
+    async function* iter_row(page_it,first_freelist_trunk_page){
+        var page_buffer = {}
+        var page_processors = {}
+        var page_processors_with_bytes = []
+        var num_bytes_buffered = 0
+        
+        function note_increase_buffered(num_bytes){
+            num_bytes_buffered = num_bytes_buffered  + num_bytes
+            if (num_bytes_buffered > max_buffer_size){
+                throw new Error('SQLite file requires a larger max_buffer_size')
+            }
+        }
+        function note_decrease_buffered(num_bytes){
+            num_bytes_buffered = num_bytes_buffered - num_bytes
+        }
+        async function* process_initial_payload(initial_payload_size,
+            full_payload_size, full_payload_processor,
+            cell_num_reader, cell_varint_reader){
+            if (initial_payload_size == full_payload_size){
+                
+                yield* await full_payload_processor(cell_num_reader, cell_varint_reader)
+            }else{
+                var initial_payload = cell_num_reader(initial_payload_size)
+                var tmp = cell_num_reader(4).buffer
+                var overflow_page = new DataView(tmp).getUint32()
+                var payload_chunks = []
+                note_increase_buffered(initial_payload.length)
+                payload_chunks.push(initial_payload)
+                var payload_remainder = full_payload_size - initial_payload_size
+
+                remember_to_process(partial(process_overflow_page,
+                    full_payload_processor, payload_chunks, payload_remainder),overflow_page)
+            }
+        }
+        function* process_overflow_page(full_payload_processor, payload_chunks, payload_remainder, page_bytes, page_reader){
+            var next_overflow_page = new DataView(page_reader(4).buffer).getUint32()
+            var num_this_page = Math.min(payload_remainder,page_bytes.length-4)
+            payload_remainder = payload_remainder - num_this_page
+            note_increase_buffered(num_this_page)
+            payload_chunks.push(page_reader(num_this_page))
+            if (!next_overflow_page){
+                var payload = []
+                for (var payload_chunk of payload_chunks){
+                    payload = payload.concat(Array.from(payload_chunk))
+                }
+                note_decrease_buffered(payload.length)
+                yield* full_payload_processor(...get_chunk_readers(Uint8Array.from(payload)))
+            }else{
+                remember_to_process(partial(process_overflow_page,
+                    full_payload_processor, payload_chunks, payload_remainder)
+                , next_overflow_page)
+            }
+        }
+        //table
+        async function* process_table_page(table_name,table_info,row_constructor, page_bytes, page_reader){
+            function get_table_initial_payload_size(p){
+                var u = page_bytes.length
+                var x = u-35
+                var m = Math.floor(32 * (u - 12) / 255) - 23
+                var k = m + (p-m)%(u-4)
+                return p<=x?p:k<=x?k:m
+            }
+            function read_table_row(rowid, cell_num_reader, cell_varint_reader){
+                function* serial_types(header_remaining, cell_varint_reader){
+                    while (header_remaining){
+                        const [value,i] = cell_varint_reader()
+                        yield value
+                        header_remaining = header_remaining - i
+                    }
+                }
+                
+                var [header_remaining,header_varint_size] = cell_varint_reader()
+                header_remaining = header_remaining - header_varint_size
+                
+                var rets = []
+                var serial_type_arr = []
+                var it = serial_types(header_remaining, cell_varint_reader)
+                var next = it.next()
+                while (!next.done){
+                    serial_type_arr.push(next.value)
+                    next = it.next()
+                }
+                for (var serial_type of serial_type_arr){
+                    var parserPair = serial_type==0?[0,(raw)=>null]:
+                            serial_type==1?[1,(raw)=>new DataView(raw.buffer).getInt8()]:
+                            serial_type==2?[2,(raw)=>new DataView(raw.buffer).getInt16()]:
+                            serial_type==3?[3,(raw)=>{
+                                var tmp_raw = new Uint8Array(4)
+                                tmp_raw.set(raw)
+                                tmp_raw.set(0,3)
+                                return new DataView(tmp_raw.buffer).getInt32()>>8
+                            }]:
+                            serial_type==4?[4,(raw)=>new DataView(raw.buffer).getInt32()]:
+                            serial_type==5?[6,(raw)=>{
+                                var tmp_raw = new Uint8Array(8)
+                                tmp_raw.set(raw)
+                                tmp_raw.set(0,6)
+                                tmp_raw.set(0,7)
+                                return new DataView(tmp_raw.buffer).getInt64()>>16
+                            }]:
+                            serial_type==6?[8,(raw)=>new DataView(raw.buffer).getInt64()]:
+                            serial_type==7?[8,(raw)=>new DataView(raw.buffer).getFloat64()]:
+                            serial_type==8?[0,(raw)=>0]:
+                            serial_type==9?[0,(raw)=>1]:
+                            serial_type%2==0?[Math.floor((serial_type - 12)/2),(raw)=>raw]:
+                            serial_type%2==1?[Math.floor((serial_type - 13)/2),(raw)=>byteToString(Array.from(raw))]:
+                            [null,null]
+                            
+                    var length = parserPair[0]
+                    var parser = parserPair[1]
+                    var ret = parser(cell_num_reader(length))
+                    rets.push(ret)
+                }
+                return row_constructor(rowid,...rets)
+            }
+            async function* process_table_leaf_master(){
+                function table_info_and_row_constructor(master_row){
+                    let sqls = master_row.sql.split("\n")
+                    let columns = []
+                    let column_names = []
+                    let integer_primary_key_indexes = []
+                    let rowid_alias_index = null
+                    for (let i=1;i<sqls.length-1;i++){
+                        let column_sql = sqls[i].substr(0,sqls[i].lastIndexOf(i==sqls.length-2?"--":",")).trim()
+                        let j = column_sql.indexOf(" ")
+                        let fname = column_sql.substr(0,j).trim(" ").trim("\"")
+                        column_sql = column_sql.substr(j)
+                        j = column_sql.indexOf(" ")
+                        let ftype = column_sql.substr(0,j).trim(" ").trim("\"")
+                        var column = {
+                            "_":"Column",
+                            "cid":i-1,
+                            "name":fname,
+                            "type":ftype,
+                            "pk":column_sql.toUpperCase().indexOf("PRIMARY KEY") > -1 ?1:0,
+                            "notnull":column_sql.toUpperCase().indexOf("NOT NULL") > -1 ?1:0,
+                            "dflt_value":null,
+                        }
+                        if (column.pk && column.type.toLowerCase()=="integer"){
+                            integer_primary_key_indexes.push(column.cid)
+                        }
+                        columns.push(column)
+                        column_names.push(column.name)
+                    }
+                    var row_namedtuple = function(ClassName,...rowvalues){
+                        let obj = {
+                            "_":ClassName
+                        }
+                        for (let i=0;i<column_names.length;i++){
+                            obj[column_names[i]] = rowvalues[i]
+                        }
+                        return obj
+                    }
+                    if (integer_primary_key_indexes.length > 0){
+                        rowid_alias_index = integer_primary_key_indexes[0]
+                    }
+                    return [columns,(rowid,...values)=>{
+                        let rowvalues = []
+                        for (let i=0;i<values.length;i++){
+                            if (i == rowid_alias_index){
+                                rowvalues.push(rowid)
+                            }else{
+                                rowvalues.push(values[i])
+                            }
+                        }
+                        return row_namedtuple('Row',...rowvalues)
+                    }]
+                }
+                function* process_master_leaf_row(rowid, cell_num_reader, cell_varint_reader){
+                    var master_row = read_table_row(rowid, cell_num_reader, cell_varint_reader)
+                    if (master_row.type == 'table'){
+                        var table_info = table_info_and_row_constructor(master_row)
+                        remember_to_process(partial(process_table_page,master_row.name, ...table_info),master_row.rootpage)
+                    }
+                    if (master_row.type == 'index'){
+                        remember_to_process(process_index_page, master_row.rootpage)
+                    }
+                }
+                const [t1,num_cells,t3,t4] = _leaf_header_unpack(page_reader(7))
+                var pointers = _unsigned_short_iter_unpack(page_reader(num_cells * 2))
+                for (var pointer of pointers){
+                    const [cell_num_reader,cell_varint_reader] = get_chunk_readers(page_bytes, pointer)
+                    const [full_payload_size,i1] = cell_varint_reader()
+                    const [rowid,i2] = cell_varint_reader()
+                    const initial_payload_size = get_table_initial_payload_size(full_payload_size)
+                    yield* await process_initial_payload(initial_payload_size, full_payload_size,
+                    partial(process_master_leaf_row,rowid),
+                    cell_num_reader, cell_varint_reader)
+                }
+            }
+            async function* process_table_leaf_non_master(){
+                function* process_non_master_leaf_row(rowid, cell_num_reader, cell_varint_reader){
+                    yield [table_name,rowid,read_table_row(rowid, cell_num_reader, cell_varint_reader)]
+                }
+                const [t1,num_cells,t3,t4] = _leaf_header_unpack(page_reader(7))
+                var pointers = _unsigned_short_iter_unpack(page_reader(num_cells * 2))
+                for (var pointer of pointers){
+                    const [cell_num_reader,cell_varint_reader] = get_chunk_readers(page_bytes, pointer)
+                    const [full_payload_size,i1] = cell_varint_reader()
+                    const [rowid,i2] = cell_varint_reader()
+                    var initial_payload_size = get_table_initial_payload_size(full_payload_size)
+                    yield* await process_initial_payload(initial_payload_size, full_payload_size,
+                        partial(process_non_master_leaf_row,rowid)
+                        ,cell_num_reader, cell_varint_reader)
+                }
+            }
+            function process_table_interior(){
+                const [t1,num_cells,t3,t4,right_most_pointer] = _interior_header_unpack(page_reader(11))
+                var pointers = _unsigned_short_iter_unpack(page_reader(num_cells * 2))
+
+                for (var pointer of pointers){
+                    
+                    const [cell_num_reader,cell_varint_reader] = get_chunk_readers(page_bytes,pointer)
+                    var page_number = new DataView(cell_num_reader(4).buffer).getUint32()
+                    remember_to_process(partial(process_table_page,table_name, table_info, row_constructor),
+                    page_number)
+                }
+                remember_to_process(partial(process_table_page,table_name, table_info, row_constructor),
+                    right_most_pointer)
+            }
+            var page_type = await page_reader(1)
+            if (arrayEqual(page_type,[13]) && table_name == 'sqlite_schema'){
+                yield* await process_table_leaf_master()
+            }else if (arrayEqual(page_type,[13])){
+                yield* await process_table_leaf_non_master()
+            }else{
+                process_table_interior()
+            }
+        }
+        //index
+        async function* process_index_page(page_bytes, page_reader){
+            function get_index_initial_payload_size(p){
+                let u = page_bytes.length
+                let x = 64 * (u - 12)
+                let m = 32 * (u - 12)
+                let k = m + (p - m) % (u - 4)
+                return p <= x?p:k <= x?k:m
+            }
+            async function* process_index_leaf(){
+                function* process_index_leaf_row(cell_num_reader, cell_varint_reader){
+                }
+
+                var [t1,num_cells,t3,t4] = _leaf_header_unpack(page_reader(7))
+                var pointers = _unsigned_short_iter_unpack(page_reader(num_cells * 2))
+                
+                for (var pointer of pointers){
+                    const [cell_num_reader, cell_varint_reader] = get_chunk_readers(page_bytes, pointer)
+                    const [full_payload_size,i1] = cell_varint_reader()
+                    const initial_payload_size = get_index_initial_payload_size(full_payload_size)
+                    yield* await process_initial_payload(
+                        initial_payload_size, full_payload_size, process_index_leaf_row,
+                        cell_num_reader, cell_varint_reader
+                    )
+                }
+            }
+            async function* process_index_interior(){
+                function* process_index_interior_row(cell_num_reader, cell_varint_reader){
+                }
+                var [t1,num_cells, t3, t4, right_most_pointer] = _interior_header_unpack(page_reader(11))
+                var pointers = _unsigned_short_iter_unpack(page_reader(num_cells * 2))
+                for (var pointer of pointers){
+                    const [cell_num_reader,cell_varint_reader] = get_chunk_readers(page_bytes, pointer)
+                    const page_num = new DataView(cell_num_reader(4).buffer).getUint32()
+                    remember_to_process(process_index_page, page_num)
+
+                    const [full_payload_size,t2] = cell_varint_reader()
+                    const initial_payload_size = get_index_initial_payload_size(full_payload_size)
+                    
+                    yield* await process_initial_payload(initial_payload_size, full_payload_size,
+                    process_index_interior_row,
+                    cell_num_reader, cell_varint_reader)
+                }
+                remember_to_process(process_index_page, right_most_pointer)
+            }
+            var page_type = await page_reader(1)
+            yield* arrayEqual(page_type,[10])?await process_index_leaf():await process_index_interior()
+        }
+        function* process_freelist_trunk_page(page_bytes, page_reader){
+            var chunk = page_reader(8)
+            var next_trunk = new DateView(chunk.slice(0,4).buffer).getUint32()
+            var num_leaves = new DateView(chunk.slice(4,8).buffer).getUint32()
+            var leaf_pages = _unsigned_long_iter_unpack(page_reader(num_leaves * 4))
+
+            for (var page_num of leaf_pages){
+                remember_to_process(process_freelist_leaf_page, page_num)
+                if (next_trunk != 0){
+                    remember_to_process(process_freelist_trunk_page, next_trunk)
+                }
+            }
+        }
+        
+        function* process_freelist_leaf_page(page_bytes, page_reader){
+        }
+        function remember_to_process(process, page_num){
+            if (!(page_num in page_buffer)){
+                page_processors[page_num] = process
+            }else{
+                const [page_bytes, page_reader] = page_buffer[page_num]
+                page_processors_with_bytes.push([process,page_bytes, page_reader])
+                delete page_buffer[page_num]
+            }
+        }
+        //todo 
+        page_processors[1] = partial(process_table_page, 'sqlite_schema', [], master_row_constructor)
+        if(first_freelist_trunk_page){
+            page_processors[first_freelist_trunk_page] = process_freelist_trunk_page
+        }
+        for await (var [page_num, page_bytes, page_reader] of page_it){
+            note_increase_buffered(page_bytes.length)
+            if (!(page_num in page_processors)){
+                page_buffer[page_num] = [page_bytes, page_reader]
+                continue
+            }
+            var process_page = page_processors[page_num]
+            delete page_processors[page_num]
+            page_processors_with_bytes.push([process_page, page_bytes, page_reader])
+
+            while (page_processors_with_bytes.length > 0){
+                var _page_processors_with_bytes = page_processors_with_bytes
+                page_processors_with_bytes = []
+                for (var [process_page, page_bytes, page_reader] of _page_processors_with_bytes){
+                    note_decrease_buffered(page_bytes.length)
+                    yield* await process_page(page_bytes, page_reader)
+                }
+            }
+        }
+        if (num_bytes_buffered != 0){
+            throw new Error('Bytes remain in cache')
+        }
+        if (Object.keys(page_processors).length != 0){
+            throw new Error("Expected a page that wasn't processed")
+        }
+    }
+    var [get_bytes, finish] = await get_byte_reader(chunk)
+    var [status,page_size, num_pages_expected, first_freelist_trunk_page, incremental_vacuum] = parse_header(await get_bytes(100))
+    var page_it = await iter_page(get_bytes, page_size, num_pages_expected, incremental_vacuum)
+    var row_it = await iter_row(page_it,first_freelist_trunk_page)
+    var row_next = await row_it.next()
+    var table_rows = []
+    while (!row_next.done){
+        var row_val = row_next.value
+        table_rows.push(row_val)
+        if (callback){
+            await callback(row_val)
+        }
+        row_next = await row_it.next()
+    }
+    return table_rows
+}   
